@@ -1,5 +1,9 @@
 This is a custom Klipper build based on the latest version, including the patch from Independant acceleration limits for X and Y axes.
 It enables separate acceleration limits for the X and Y axes, which can help reduce vibrations and improve motion accuracy during high-speed printing.
+(Edited with AI)
+
+Reference:
+https://klipper.discourse.group/t/independant-acceleration-limits-for-x-and-y-axes/3831
 ----
 Welcome to the Klipper project!
 
