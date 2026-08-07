@@ -9,6 +9,44 @@ RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
+class DualLayerMAD:
+    def __init__(self, window_size=32):
+        self.window_size = window_size
+        self.history = []
+
+    def update(self, value):
+        self.history.append(value)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+
+    def get_variance(self):
+        n = len(self.history)
+        if n < 4:
+            return 0.0
+
+        sorted_history = sorted(self.history)
+        med = sorted_history[n // 2]
+        abs_devs = [abs(x - med) for x in self.history]
+        sorted_abs_devs = sorted(abs_devs)
+        mad1 = sorted_abs_devs[n // 2]
+        if mad1 == 0: mad1 = 1e-9
+
+        threshold = 2.5 * mad1
+        candidates = [x for x, dev in zip(self.history, abs_devs) if dev <= threshold]
+
+        c_len = len(candidates)
+        if c_len < 2:
+            return mad1 * 1.4826
+
+        sorted_candidates = sorted(candidates)
+        pure_med = sorted_candidates[c_len // 2]
+        
+        pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
+        pure_mad = pure_abs_devs[c_len // 2]
+
+        return pure_mad * 1.4826
+
+
 class ClockSync:
     def __init__(self, reactor):
         self.reactor = reactor
@@ -30,6 +68,7 @@ class ClockSync:
         self.min_rtt_time = 0.
         # System clock to mcu clock estimation (updated in bg thread)
         self.clock_est = (0., 0., 0.)
+        self.dlmad = DualLayerMAD(window_size=32)
     def connect(self, serial):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
@@ -86,8 +125,14 @@ class ClockSync:
             self.prediction_variance = (.001 * self.mcu_freq)**2
         else:
             self.last_prediction_time = sent_time
-            self.prediction_variance = (
-                (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
+            # Inject DLMAD for variance calculation
+            self.dlmad.update(clock - exp_clock)
+            dlmad_var = self.dlmad.get_variance()
+            if dlmad_var > 0:
+                self.prediction_variance = dlmad_var**2
+            else:
+                self.prediction_variance = (
+                    (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
         # Add clock and sent_time to linear regression
         diff_sent_time = sent_time - self.time_avg
         self.time_avg += DECAY * diff_sent_time
@@ -133,6 +178,15 @@ class ClockSync:
         self._update_best_rtt(sent_time, receive_time)
         self.clock_est = (self.time_avg + self.min_half_rtt,
                           self.clock_avg, new_freq)
+        
+        # Dump raw clocksync debug data for IMU cross-verification
+        half_rtt = .5 * (receive_time - sent_time)
+        raw_offset = self.estimate_clock_systime(clock) - sent_time - half_rtt
+        try:
+            with open("/tmp/clocksync_dump.csv", "a") as f:
+                f.write("%.6f,%.6f,%.6f,%.6f\n" % (sent_time, half_rtt, raw_offset, pred_stddev))
+        except Exception:
+            pass
     # clock frequency conversions
     def print_time_to_clock(self, print_time):
         return int(print_time * self.mcu_freq)
