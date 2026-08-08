@@ -59,6 +59,31 @@ class DualLayerMAD:
 
         return pure_mad * 1.4826
 
+class QuantileFilter:
+    def __init__(self, window_size=32, quantile=0.9):
+        self.window_size = window_size
+        self.quantile = quantile
+        self.history = []
+
+    def update(self, rtt, value):
+        self.history.append((rtt, value))
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+
+    def get_stddev(self):
+        n = len(self.history)
+        if n < 2:
+            return 0.0
+        sorted_by_rtt = sorted(self.history, key=lambda x: x[0])
+        keep_count = max(2, int(n * self.quantile))
+        kept = sorted_by_rtt[:keep_count]
+        values = [x[1] for x in kept]
+        mean = sum(values) / len(values)
+        variance = sum((x - mean)**2 for x in values) / (len(values) - 1)
+        import math
+        return math.sqrt(max(0, variance))
+
+
 
 class ClockSync:
     def __init__(self, reactor):
@@ -82,6 +107,9 @@ class ClockSync:
         # System clock to mcu clock estimation (updated in bg thread)
         self.clock_est = (0., 0., 0.)
         self.dlmad = DualLayerMAD(window_size=32)
+        self.timofey_filter = QuantileFilter(window_size=32, quantile=0.9)
+        self.ema_variance = 0.0
+        self.timofey_variance = 0.0
     def connect(self, serial):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
@@ -117,7 +145,7 @@ class ClockSync:
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
         return eventtime + .9839
-    def _update_regression(self, sent_time, clock):
+    def _update_regression(self, sent_time, clock, half_rtt=0.0):
         # Calculate expected clock using existing time/clock regression
         old_freq = self.clock_est[2] # self.clock_covariance/self.time_variance
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
@@ -136,6 +164,8 @@ class ClockSync:
                          sent_time, old_freq, clock - exp_clock,
                          math.sqrt(self.prediction_variance))
             self.prediction_variance = (.001 * self.mcu_freq)**2
+            self.ema_variance = self.prediction_variance
+            self.timofey_variance = self.prediction_variance
         else:
             self.last_prediction_time = sent_time
             # Inject DLMAD for variance calculation
@@ -146,6 +176,20 @@ class ClockSync:
             else:
                 self.prediction_variance = (
                     (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
+            
+            # Maintainer's Quantile Filter
+            self.timofey_filter.update(half_rtt, clock - exp_clock)
+            t_stddev = self.timofey_filter.get_stddev()
+            if t_stddev > 0:
+                self.timofey_variance = t_stddev**2
+            else:
+                self.timofey_variance = self.prediction_variance
+                
+            # Original EMA (for comparison)
+            if getattr(self, 'ema_variance', 0.0) == 0.0:
+                self.ema_variance = self.prediction_variance
+            self.ema_variance = (1. - DECAY) * (self.ema_variance + clock_diff2 * DECAY)
+            
         # Add clock and sent_time to linear regression
         diff_sent_time = sent_time - self.time_avg
         self.time_avg += DECAY * diff_sent_time
@@ -178,7 +222,8 @@ class ClockSync:
             # sent_time unknown because of 'get_clock' retransmit
             return
         # Update sent_time to clock regression
-        ret = self._update_regression(sent_time, clock)
+        half_rtt = .5 * (receive_time - sent_time)
+        ret = self._update_regression(sent_time, clock, half_rtt)
         if not ret:
             # Message is an "outlier" and should be discarded
             return
@@ -192,12 +237,15 @@ class ClockSync:
         self.clock_est = (self.time_avg + self.min_half_rtt,
                           self.clock_avg, new_freq)
         
-        # Dump raw clocksync debug data for IMU cross-verification
-        half_rtt = .5 * (receive_time - sent_time)
+        # Dump raw clocksync debug data for A/B/C cross-verification
         raw_offset = self.estimate_clock_systime(clock) - sent_time - half_rtt
         try:
-            with open("/tmp/clocksync_dump.csv", "a") as f:
-                f.write("%.6f,%.6f,%.6f,%.6f\n" % (sent_time, half_rtt, raw_offset, pred_stddev))
+            ema_stddev = math.sqrt(getattr(self, 'ema_variance', self.prediction_variance))
+            timofey_stddev = math.sqrt(getattr(self, 'timofey_variance', self.prediction_variance))
+            
+            with open("/tmp/clocksync_dump_abc.csv", "a") as f:
+                f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (
+                    sent_time, half_rtt, raw_offset, ema_stddev, pred_stddev, timofey_stddev))
         except Exception:
             pass
     # clock frequency conversions
