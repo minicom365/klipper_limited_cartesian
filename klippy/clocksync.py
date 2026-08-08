@@ -20,19 +20,32 @@ class DualLayerMAD:
             self.history.pop(0)
 
     def get_variance(self):
-        n = len(self.history)
-        if n < 4:
+        if not self.history:
             return 0.0
 
-        sorted_history = sorted(self.history)
+        # Point-symmetry warmup at t=0 (fill negative time window across (0, v0))
+        if len(self.history) < self.window_size:
+            v0 = self.history[0]
+            # Reflected virtual samples in negative time: v_neg = 2*v0 - v
+            virtual = [2.0 * v0 - x for x in reversed(self.history[1:])]
+            sample_set = (virtual + self.history)[-self.window_size:]
+        else:
+            sample_set = self.history
+
+        n = len(sample_set)
+        if n < 2:
+            return 0.0
+
+        sorted_history = sorted(sample_set)
         med = sorted_history[n // 2]
-        abs_devs = [abs(x - med) for x in self.history]
+        abs_devs = [abs(x - med) for x in sample_set]
         sorted_abs_devs = sorted(abs_devs)
         mad1 = sorted_abs_devs[n // 2]
-        if mad1 == 0: mad1 = 1e-9
+        if mad1 == 0:
+            mad1 = 1e-9
 
         threshold = 2.5 * mad1
-        candidates = [x for x, dev in zip(self.history, abs_devs) if dev <= threshold]
+        candidates = [x for x, dev in zip(sample_set, abs_devs) if dev <= threshold]
 
         c_len = len(candidates)
         if c_len < 2:
@@ -40,7 +53,7 @@ class DualLayerMAD:
 
         sorted_candidates = sorted(candidates)
         pure_med = sorted_candidates[c_len // 2]
-        
+
         pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
         pure_mad = pure_abs_devs[c_len // 2]
 
