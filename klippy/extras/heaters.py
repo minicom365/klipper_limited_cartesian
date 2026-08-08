@@ -239,6 +239,9 @@ class ControlPID:
                 raise config.error(
                     "Adaptive PID requires at least two pid_table_ entries")
             self.adaptive = True
+            config.get('pid_Kp', None)
+            config.get('pid_Ki', None)
+            config.get('pid_Kd', None)
             self.pid_table = []
             for option in sorted(pid_options):
                 value = config.get(option)

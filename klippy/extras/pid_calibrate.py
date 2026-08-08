@@ -65,11 +65,16 @@ class PIDCalibrate:
         configfile.set(cfgname, 'control', 'pid')
 
         if len(results) == 1:
+            for i in range(20):
+                configfile.remove_option(cfgname, 'pid_table_%d' % i)
             Kp, Ki, Kd = results[0][1:]
             configfile.set(cfgname, 'pid_Kp', "%.3f" % (Kp,))
             configfile.set(cfgname, 'pid_Ki', "%.3f" % (Ki,))
             configfile.set(cfgname, 'pid_Kd', "%.3f" % (Kd,))
         else:
+            configfile.remove_option(cfgname, 'pid_Kp')
+            configfile.remove_option(cfgname, 'pid_Ki')
+            configfile.remove_option(cfgname, 'pid_Kd')
             for i in range(len(results), 20):
                 configfile.remove_option(cfgname, 'pid_table_%d' % i)
 
