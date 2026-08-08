@@ -95,9 +95,8 @@ class PIDCalibrate:
 
         gcmd.respond_info(
             "PID parameters (%s):\n%s\n"
-            "The SAVE_CONFIG command will update the printer "
-                 "config file with these "
-            "parameters and restart the printer."
+            "The SAVE_CONFIG command will update the printer config file "
+            "with these parameters and restart the printer."
             % (algo, '\n'.join(msg_lines))
         )
 
@@ -201,7 +200,8 @@ class ControlAutoTune:
         Ki = Kp / Ti
         Kd = Kp * Td
         logging.info("Autotune (%s): raw=%f/%f Ku=%f Tu=%f  Kp=%f Ki=%f Kd=%f",
-                     algo, temp_diff, self.heater_max_power, Ku, Tu, Kp, Ki, Kd)
+                     algo, temp_diff, self.heater_max_power, Ku, Tu,
+                     Kp, Ki, Kd)
         return Kp, Ki, Kd
 
     def calc_final_pid(self, algo='classic-zn'):

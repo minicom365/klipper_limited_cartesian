@@ -88,8 +88,8 @@ class Heater:
             return
         pwm_time = read_time + self.pwm_delay
         self.next_pwm_time = (pwm_time + MAX_HEAT_TIME
-                              - (3. * self.pwm_delay +
-                                 self._pwm_cycle_time + 0.001))
+                              - (3. * self.pwm_delay + self._pwm_cycle_time
+                                 + 0.001))
         self.last_pwm_value = value
         if self._last_pwm_time and self._last_pwm_time < pwm_time:
             delta_pwm_time = pwm_time - self._last_pwm_time
