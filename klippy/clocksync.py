@@ -9,8 +9,6 @@ RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
-<<<<<<< HEAD
-=======
 class DualLayerMAD:
     def __init__(self, window_size=32):
         self.window_size = window_size
@@ -25,11 +23,7 @@ class DualLayerMAD:
         if not self.history:
             return 0.0
 
-<<<<<<< Updated upstream
-        # Point-symmetry warmup at t=0 (fill negative time window across (0, v0))
-=======
         # Point-symmetry warmup at t=0 (fill negative time window)
->>>>>>> Stashed changes
         if len(self.history) < self.window_size:
             v0 = self.history[0]
             # Reflected virtual samples in negative time: v_neg = 2*v0 - v
@@ -51,13 +45,9 @@ class DualLayerMAD:
             mad1 = 1e-9
 
         threshold = 2.5 * mad1
-<<<<<<< Updated upstream
-        candidates = [x for x, dev in zip(sample_set, abs_devs) if dev <= threshold]
-=======
         candidates = [
             x for x, dev in zip(sample_set, abs_devs) if dev <= threshold
         ]
->>>>>>> Stashed changes
 
         c_len = len(candidates)
         if c_len < 2:
@@ -71,36 +61,6 @@ class DualLayerMAD:
 
         return pure_mad * 1.4826
 
-<<<<<<< Updated upstream
-class QuantileFilter:
-    def __init__(self, window_size=32, quantile=0.9):
-        self.window_size = window_size
-        self.quantile = quantile
-        self.history = []
-
-    def update(self, rtt, value):
-        self.history.append((rtt, value))
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-
-    def get_stddev(self):
-        n = len(self.history)
-        if n < 2:
-            return 0.0
-        sorted_by_rtt = sorted(self.history, key=lambda x: x[0])
-        keep_count = max(2, int(n * self.quantile))
-        kept = sorted_by_rtt[:keep_count]
-        values = [x[1] for x in kept]
-        mean = sum(values) / len(values)
-        variance = sum((x - mean)**2 for x in values) / (len(values) - 1)
-        import math
-        return math.sqrt(max(0, variance))
-
-
-
-=======
->>>>>>> Stashed changes
->>>>>>> 718a563d6 (feat(clocksync): integrate DualLayerMAD & add sanitized 4x4 matrix research toolkit)
 class ClockSync:
     def __init__(self, reactor):
         self.reactor = reactor
@@ -122,17 +82,7 @@ class ClockSync:
         self.min_rtt_time = 0.
         # System clock to mcu clock estimation (updated in bg thread)
         self.clock_est = (0., 0., 0.)
-<<<<<<< HEAD
-=======
         self.dlmad = DualLayerMAD(window_size=32)
-<<<<<<< Updated upstream
-        self.timofey_filter = QuantileFilter(window_size=32, quantile=0.9)
-        self.ema_variance = 0.0
-        self.timofey_variance = 0.0
-=======
-
->>>>>>> Stashed changes
->>>>>>> 718a563d6 (feat(clocksync): integrate DualLayerMAD & add sanitized 4x4 matrix research toolkit)
     def connect(self, serial):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
@@ -172,15 +122,7 @@ class ClockSync:
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
         return eventtime + .9839
-<<<<<<< HEAD
-    def _update_regression(self, sent_time, clock):
-=======
-<<<<<<< Updated upstream
-=======
-
->>>>>>> Stashed changes
     def _update_regression(self, sent_time, clock, half_rtt=0.0):
->>>>>>> 718a563d6 (feat(clocksync): integrate DualLayerMAD & add sanitized 4x4 matrix research toolkit)
         # Calculate expected clock using existing time/clock regression
         old_freq = self.clock_est[2]
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
@@ -197,6 +139,7 @@ class ClockSync:
             logging.info("Resetting prediction variance %.3f:"
                          " freq=%d diff=%d stddev=%.3f",
                          sent_time, old_freq, clock - exp_clock,
+                         math.sqrt(self.prediction_variance))
             self.prediction_variance = (.001 * self.mcu_freq)**2
             self.dlmad = DualLayerMAD(window_size=32)
         else:
@@ -268,9 +211,6 @@ class ClockSync:
         # Update time translation (mainly for multi-mcu synchronization)
         self._update_best_rtt(sent_time, receive_time)
         self.clock_est = (self.time_avg + self.min_half_rtt,
-                          self.clock_avg, new_freq)
-<<<<<<< Updated upstream
-        
         # Dump raw clocksync debug data for offline A/B/C verification
         try:
             half_rtt = .5 * (receive_time - sent_time)
@@ -280,9 +220,6 @@ class ClockSync:
                     sent_time, half_rtt, raw_offset, pred_stddev))
         except Exception:
             pass
-=======
-
->>>>>>> Stashed changes
     # clock frequency conversions
     def print_time_to_clock(self, print_time):
         return int(print_time * self.mcu_freq)
