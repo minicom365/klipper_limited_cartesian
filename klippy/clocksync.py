@@ -127,9 +127,15 @@ class ClockSync:
         old_freq = self.clock_est[2]
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
         # Track prediction accuracy and filter out extreme outliers
+        # RTT-Aware Outlier Rejection Floor: Allow legitimate high-RTT network/USB delays
+        # without falsely discarding clock samples when DLMAD reduces prediction_variance.
         clock_diff2 = (clock - exp_clock)**2
-        if (clock_diff2 > 25. * self.prediction_variance
-            and clock_diff2 > (.000500 * self.mcu_freq)**2):
+        max_allowed_diff2 = max(
+            25. * self.prediction_variance,
+            (2.0 * half_rtt * self.mcu_freq)**2,
+            (.000500 * self.mcu_freq)**2
+        )
+        if clock_diff2 > max_allowed_diff2:
             if clock > exp_clock and sent_time < self.last_prediction_time+10.:
                 logging.debug("Ignoring clock sample %.3f:"
                               " freq=%d diff=%d stddev=%.3f",
