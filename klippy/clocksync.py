@@ -243,6 +243,9 @@ class ClockSync:
             ema_stddev = math.sqrt(getattr(self, 'ema_variance', self.prediction_variance))
             timofey_stddev = math.sqrt(getattr(self, 'timofey_variance', self.prediction_variance))
             
+            with open("/tmp/clocksync_dump.csv", "a") as f:
+                f.write("%.6f,%.6f,%.6f,%.6f\n" % (
+                    sent_time, half_rtt, raw_offset, pred_stddev))
             with open("/tmp/clocksync_dump_abc.csv", "a") as f:
                 f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (
                     sent_time, half_rtt, raw_offset, ema_stddev, pred_stddev, timofey_stddev))
