@@ -163,9 +163,10 @@ class ClockSync:
             self.last_prediction_time = sent_time
             self.dlmad.update(clock - exp_clock)
             dlmad_var = self.dlmad.get_variance()
-            # Physical threshold: 1.0 MCU clock tick floor. Since measurements are quantized to
-            # integer clock ticks, sub-tick variance (<1.0 tick) is numerical artifact/residual,
-            # not true statistical signal. This prevents 1.48e-9 sub-tick fallback bypass.
+            # Physical threshold: 1.0 MCU clock tick floor.
+            # Measurements are quantized to integer clock ticks.
+            # Sub-tick variance (<1.0 tick) is numerical artifact.
+            # This prevents 1.48e-9 sub-tick fallback bypass.
             if dlmad_var >= 1.0:
                 self.prediction_variance = dlmad_var**2
             else:
@@ -175,10 +176,15 @@ class ClockSync:
                     )
                 )
 
-        # Raw Data Dumper for ab_stress_tester_v2.py (Dual-column logging: dlmad_raw vs effective_variance)
+        # Raw Data Dumper for ab_stress_tester_v2.py
+        # Dual-column logging: dlmad_raw vs effective_variance
         try:
-            raw_dlmad_sec = dlmad_var / self.mcu_freq if 'dlmad_var' in locals() else 0.0
-            effective_stddev_sec = math.sqrt(self.prediction_variance) / self.mcu_freq
+            raw_dlmad_sec = 0.0
+            if 'dlmad_var' in locals():
+                raw_dlmad_sec = dlmad_var / self.mcu_freq
+            effective_stddev_sec = (
+                math.sqrt(self.prediction_variance) / self.mcu_freq
+            )
             with open("/tmp/clocksync_dump.csv", "a") as f:
                 f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%d\n" % (
                     sent_time, half_rtt,
