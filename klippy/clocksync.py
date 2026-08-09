@@ -199,7 +199,8 @@ class ClockSync:
             # sent_time unknown because of 'get_clock' retransmit
             return
         # Update sent_time to clock regression
-        ret = self._update_regression(sent_time, clock)
+        half_rtt = .5 * (receive_time - sent_time)
+        ret = self._update_regression(sent_time, clock, half_rtt)
         if not ret:
             # Message is an "outlier" and should be discarded
             return
@@ -211,15 +212,7 @@ class ClockSync:
         # Update time translation (mainly for multi-mcu synchronization)
         self._update_best_rtt(sent_time, receive_time)
         self.clock_est = (self.time_avg + self.min_half_rtt,
-        # Dump raw clocksync debug data for offline A/B/C verification
-        try:
-            half_rtt = .5 * (receive_time - sent_time)
-            raw_offset = self.estimate_clock_systime(clock) - sent_time - half_rtt
-            with open("/tmp/clocksync_dump.csv", "a") as f:
-                f.write("%.6f,%.6f,%.6f,%.6f\n" % (
-                    sent_time, half_rtt, raw_offset, pred_stddev))
-        except Exception:
-            pass
+                          self.clock_avg, new_freq)
     # clock frequency conversions
     def print_time_to_clock(self, print_time):
         return int(print_time * self.mcu_freq)
