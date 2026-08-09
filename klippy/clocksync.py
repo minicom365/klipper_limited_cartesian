@@ -347,3 +347,4 @@ class SecondarySync(ClockSync):
         self.clock_adj = (adjusted_offset, adjusted_freq)
         self.last_sync_time = sync2_print_time
         return self.clock_adj
+# Force refresh commit for SecondarySync fix
