@@ -93,6 +93,7 @@ class ClockSync:
         self.time_avg = params['#sent_time']
         self.clock_est = (self.time_avg, self.clock_avg, self.mcu_freq)
         self.prediction_variance = (.001 * self.mcu_freq)**2
+        self.ema_variance = (.001 * self.mcu_freq)**2
         # Enable periodic get_clock timer
         for i in range(8):
             self.reactor.pause(self.reactor.monotonic() + 0.050)
@@ -126,10 +127,26 @@ class ClockSync:
         # Calculate expected clock using existing time/clock regression
         old_freq = self.clock_est[2]
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
-        # Track prediction accuracy and filter out extreme outliers
         clock_diff2 = (clock - exp_clock)**2
-        if (clock_diff2 > 25. * self.prediction_variance
+
+        # Side-by-Side Original Klipper EMA Simulation Predictor
+        ema_would_reject = 0
+        if (clock_diff2 > 25. * self.ema_variance
             and clock_diff2 > (.000500 * self.mcu_freq)**2):
+            if clock > exp_clock and sent_time < self.last_prediction_time+10.:
+                ema_would_reject = 1
+            self.ema_variance = (.001 * self.mcu_freq)**2
+        else:
+            self.ema_variance = (1. - DECAY) * (
+                self.ema_variance + clock_diff2 * DECAY)
+
+        # DLMAD + RTT-Aware Outlier Rejection Floor Patch
+        max_allowed_diff2 = max(
+            25. * self.prediction_variance,
+            (2.0 * half_rtt * self.mcu_freq)**2,
+            (.000500 * self.mcu_freq)**2
+        )
+        if clock_diff2 > max_allowed_diff2:
             if clock > exp_clock and sent_time < self.last_prediction_time+10.:
                 logging.debug("Ignoring clock sample %.3f:"
                               " freq=%d diff=%d stddev=%.3f",
@@ -158,10 +175,11 @@ class ClockSync:
         # Raw Data Dumper for ab_stress_tester_v2.py
         try:
             with open("/tmp/clocksync_dump.csv", "a") as f:
-                f.write("%.6f,%.6f,%.6f,%.6f\n" % (
+                f.write("%.6f,%.6f,%.6f,%.6f,%d\n" % (
                     sent_time, half_rtt,
                     (clock - exp_clock) / self.mcu_freq,
-                    math.sqrt(self.prediction_variance) / self.mcu_freq
+                    math.sqrt(self.prediction_variance) / self.mcu_freq,
+                    ema_would_reject
                 ))
         except Exception:
             pass
