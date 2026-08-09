@@ -9,82 +9,6 @@ RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
-class DualLayerMAD:
-    def __init__(self, window_size=32):
-        self.window_size = window_size
-        self.history = []
-
-    def update(self, value):
-        self.history.append(value)
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-
-    def get_variance(self):
-        if not self.history:
-            return 0.0
-
-        # Point-symmetry warmup at t=0 (fill negative time window across (0, v0))
-        if len(self.history) < self.window_size:
-            v0 = self.history[0]
-            # Reflected virtual samples in negative time: v_neg = 2*v0 - v
-            virtual = [2.0 * v0 - x for x in reversed(self.history[1:])]
-            sample_set = (virtual + self.history)[-self.window_size:]
-        else:
-            sample_set = self.history
-
-        n = len(sample_set)
-        if n < 2:
-            return 0.0
-
-        sorted_history = sorted(sample_set)
-        med = sorted_history[n // 2]
-        abs_devs = [abs(x - med) for x in sample_set]
-        sorted_abs_devs = sorted(abs_devs)
-        mad1 = sorted_abs_devs[n // 2]
-        if mad1 == 0:
-            mad1 = 1e-9
-
-        threshold = 2.5 * mad1
-        candidates = [x for x, dev in zip(sample_set, abs_devs) if dev <= threshold]
-
-        c_len = len(candidates)
-        if c_len < 2:
-            return mad1 * 1.4826
-
-        sorted_candidates = sorted(candidates)
-        pure_med = sorted_candidates[c_len // 2]
-
-        pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
-        pure_mad = pure_abs_devs[c_len // 2]
-
-        return pure_mad * 1.4826
-
-class QuantileFilter:
-    def __init__(self, window_size=32, quantile=0.9):
-        self.window_size = window_size
-        self.quantile = quantile
-        self.history = []
-
-    def update(self, rtt, value):
-        self.history.append((rtt, value))
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-
-    def get_stddev(self):
-        n = len(self.history)
-        if n < 2:
-            return 0.0
-        sorted_by_rtt = sorted(self.history, key=lambda x: x[0])
-        keep_count = max(2, int(n * self.quantile))
-        kept = sorted_by_rtt[:keep_count]
-        values = [x[1] for x in kept]
-        mean = sum(values) / len(values)
-        variance = sum((x - mean)**2 for x in values) / (len(values) - 1)
-        import math
-        return math.sqrt(max(0, variance))
-
-
-
 class ClockSync:
     def __init__(self, reactor):
         self.reactor = reactor
@@ -106,10 +30,6 @@ class ClockSync:
         self.min_rtt_time = 0.
         # System clock to mcu clock estimation (updated in bg thread)
         self.clock_est = (0., 0., 0.)
-        self.dlmad = DualLayerMAD(window_size=32)
-        self.timofey_filter = QuantileFilter(window_size=32, quantile=0.9)
-        self.ema_variance = 0.0
-        self.timofey_variance = 0.0
     def connect(self, serial):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
@@ -145,7 +65,7 @@ class ClockSync:
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
         return eventtime + .9839
-    def _update_regression(self, sent_time, clock, half_rtt=0.0):
+    def _update_regression(self, sent_time, clock):
         # Calculate expected clock using existing time/clock regression
         old_freq = self.clock_est[2] # self.clock_covariance/self.time_variance
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
@@ -164,32 +84,10 @@ class ClockSync:
                          sent_time, old_freq, clock - exp_clock,
                          math.sqrt(self.prediction_variance))
             self.prediction_variance = (.001 * self.mcu_freq)**2
-            self.ema_variance = self.prediction_variance
-            self.timofey_variance = self.prediction_variance
         else:
             self.last_prediction_time = sent_time
-            # Inject DLMAD for variance calculation
-            self.dlmad.update(clock - exp_clock)
-            dlmad_var = self.dlmad.get_variance()
-            if dlmad_var > 0:
-                self.prediction_variance = dlmad_var**2
-            else:
-                self.prediction_variance = (
-                    (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
-            
-            # Maintainer's Quantile Filter
-            self.timofey_filter.update(half_rtt, clock - exp_clock)
-            t_stddev = self.timofey_filter.get_stddev()
-            if t_stddev > 0:
-                self.timofey_variance = t_stddev**2
-            else:
-                self.timofey_variance = self.prediction_variance
-                
-            # Original EMA (for comparison)
-            if getattr(self, 'ema_variance', 0.0) == 0.0:
-                self.ema_variance = self.prediction_variance
-            self.ema_variance = (1. - DECAY) * (self.ema_variance + clock_diff2 * DECAY)
-            
+            self.prediction_variance = (
+                (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
         # Add clock and sent_time to linear regression
         diff_sent_time = sent_time - self.time_avg
         self.time_avg += DECAY * diff_sent_time
@@ -222,8 +120,7 @@ class ClockSync:
             # sent_time unknown because of 'get_clock' retransmit
             return
         # Update sent_time to clock regression
-        half_rtt = .5 * (receive_time - sent_time)
-        ret = self._update_regression(sent_time, clock, half_rtt)
+        ret = self._update_regression(sent_time, clock)
         if not ret:
             # Message is an "outlier" and should be discarded
             return
@@ -237,18 +134,13 @@ class ClockSync:
         self.clock_est = (self.time_avg + self.min_half_rtt,
                           self.clock_avg, new_freq)
         
-        # Dump raw clocksync debug data for A/B/C cross-verification
-        raw_offset = self.estimate_clock_systime(clock) - sent_time - half_rtt
+        # Dump raw clocksync debug data for offline A/B/C verification
         try:
-            ema_stddev = math.sqrt(getattr(self, 'ema_variance', self.prediction_variance))
-            timofey_stddev = math.sqrt(getattr(self, 'timofey_variance', self.prediction_variance))
-            
+            half_rtt = .5 * (receive_time - sent_time)
+            raw_offset = self.estimate_clock_systime(clock) - sent_time - half_rtt
             with open("/tmp/clocksync_dump.csv", "a") as f:
                 f.write("%.6f,%.6f,%.6f,%.6f\n" % (
                     sent_time, half_rtt, raw_offset, pred_stddev))
-            with open("/tmp/clocksync_dump_abc.csv", "a") as f:
-                f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % (
-                    sent_time, half_rtt, raw_offset, ema_stddev, pred_stddev, timofey_stddev))
         except Exception:
             pass
     # clock frequency conversions
@@ -347,4 +239,3 @@ class SecondarySync(ClockSync):
         self.clock_adj = (adjusted_offset, adjusted_freq)
         self.last_sync_time = sync2_print_time
         return self.clock_adj
-# Force refresh commit for SecondarySync fix
