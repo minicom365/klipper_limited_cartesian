@@ -9,6 +9,59 @@ RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
+class DualLayerMAD:
+    def __init__(self, window_size=32):
+        self.window_size = window_size
+        self.history = []
+
+    def update(self, value):
+        self.history.append(value)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+
+    def get_variance(self):
+        if not self.history:
+            return 0.0
+
+        # Point-symmetry warmup at t=0
+        # (fill negative time window across (0, v0))
+        if len(self.history) < self.window_size:
+            v0 = self.history[0]
+            # Reflected virtual samples in negative time: v_neg = 2*v0 - v
+            virtual = [2.0 * v0 - x for x in reversed(self.history[1:])]
+            sample_set = (virtual + self.history)[-self.window_size:]
+        else:
+            sample_set = self.history
+
+        n = len(sample_set)
+        if n < 2:
+            return 0.0
+
+        sorted_history = sorted(sample_set)
+        med = sorted_history[n // 2]
+        abs_devs = [abs(x - med) for x in sample_set]
+        sorted_abs_devs = sorted(abs_devs)
+        mad1 = sorted_abs_devs[n // 2]
+        if mad1 == 0:
+            return 0.0
+
+        threshold = 2.5 * mad1
+        candidates = [
+            x for x, dev in zip(sample_set, abs_devs) if dev <= threshold
+        ]
+
+        c_len = len(candidates)
+        if c_len < 2:
+            return mad1 * 1.4826
+
+        sorted_candidates = sorted(candidates)
+        pure_med = sorted_candidates[c_len // 2]
+
+        pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
+        pure_mad = pure_abs_devs[c_len // 2]
+
+        return pure_mad * 1.4826
+
 class ClockSync:
     def __init__(self, reactor):
         self.reactor = reactor
@@ -30,6 +83,7 @@ class ClockSync:
         self.min_rtt_time = 0.
         # System clock to mcu clock estimation (updated in bg thread)
         self.clock_est = (0., 0., 0.)
+        self.dlmad = DualLayerMAD(window_size=32)
     def connect(self, serial):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
@@ -65,7 +119,7 @@ class ClockSync:
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
         return eventtime + .9839
-    def _update_regression(self, sent_time, clock):
+    def _update_regression(self, sent_time, clock, half_rtt=0.0):
         # Calculate expected clock using existing time/clock regression
         old_freq = self.clock_est[2] # self.clock_covariance/self.time_variance
         exp_clock = (sent_time - self.time_avg) * old_freq + self.clock_avg
@@ -86,8 +140,17 @@ class ClockSync:
             self.prediction_variance = (.001 * self.mcu_freq)**2
         else:
             self.last_prediction_time = sent_time
-            self.prediction_variance = (
-                (1. - DECAY) * (self.prediction_variance + clock_diff2 * DECAY))
+            # Inject DLMAD for variance calculation
+            self.dlmad.update(clock - exp_clock)
+            dlmad_var = self.dlmad.get_variance()
+            if dlmad_var >= 1.0:
+                self.prediction_variance = dlmad_var**2
+            else:
+                self.prediction_variance = (
+                    (1. - DECAY) * (
+                        self.prediction_variance + clock_diff2 * DECAY
+                    )
+                )
         # Add clock and sent_time to linear regression
         diff_sent_time = sent_time - self.time_avg
         self.time_avg += DECAY * diff_sent_time
