@@ -1,0 +1,30 @@
+# Klipper STM32F103 Hardware-in-the-Loop (HIL) Renode Startup Script (.resc)
+# Steps before launching:
+#   1. Seed /tmp/klipper_hil_adc.txt (e.g. "0=3980,13=3980,16=1750") via synth-thermistor-adc.
+#   2. Generate exact LTO SysTick AddHook lines for your out/klipper.elf via:
+#      uv run .agents/skills/klipper-mcu-emulation-forensics/scripts/klipper_hil_cli.py resolve-armcm-hooks \
+#        --elf out/klipper.elf --objdump-bin arm-none-eabi-objdump --limit 32 --output /tmp/hooks.json
+#   3. Insert the emitted `sysbus.cpu AddHook ...` commands below BEFORE `start`.
+#   4. Run: renode --disable-xwt --port 19991 klipper_hil_session.resc
+
+logFile @/tmp/klipper_renode.log
+mach create "klipper_stm32_hil"
+machine LoadPlatformDescription @.agents/skills/klipper-mcu-emulation-forensics/assets/stm32f103_klipper_generic.repl
+sysbus LoadELF @out/klipper.elf
+
+sysbus.cpu VectorTableOffset 0x08000000
+sysbus.cpu PerformanceInMips 95
+emulation SetGlobalQuantum "0.000500"
+
+emulation CreateUartPtyTerminal "klipper_uart" "/tmp/klipper_mcu_pty" true
+connector Connect sysbus.usart1 klipper_uart
+
+# Capture every 1 us GPIO ODR (0x0C), BSRR (0x10), and BRR (0x14) bus write
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortC "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f C 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortB "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f B 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortA "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f A 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
+
+# Paste `resolve-armcm-hooks` output lines right here BEFORE `start`:
+# sysbus.cpu AddHook 0x0800xxxx "self.SetRegisterUlong(...)"
+
+start
