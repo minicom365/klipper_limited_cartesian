@@ -12,7 +12,7 @@ description: >-
 license: GPL-3.0-or-later
 compatibility: Python 3.9+, uv, arm-none-eabi-binutils, Renode 1.14+ (Linux/WSL/macOS)
 metadata:
-  version: 1.0.0
+  version: 1.1.0
   domain: klipper-3d-printing
 ---
 
@@ -77,13 +77,14 @@ All automation subcommands live in [`scripts/klipper_hil_cli.py`](./scripts/klip
 
 | Subcommand | Purpose | Required Arguments |
 | :--- | :--- | :--- |
-| `resolve-armcm-hooks` | Disassembles `out/klipper.elf` (`-flto` safe) to locate `armcm_timer.c` `SysTick->LOAD = 0` stores (`0xE000E000 + #20`) and emits Renode `AddHook` lines. | `--elf`, `--objdump-bin`, `--limit`, `--output` |
+| `resolve-armcm-hooks` | Disassembles `out/klipper.elf` (`-flto` safe) to auto-detect `VectorTableOffset` (`0x08000000` vs bootloader offsets) and emit `armcm_timer.c` `SysTick->LOAD = 0` `AddHook` lines. | `--elf`, `--objdump-bin`, `--limit`, `--output` |
 | `synth-thermistor-adc` | Inverts Klipper 3-point thermistor tables (`pullup_resistor`, `adc_max`) into exact ADC counts with `ControlPID` `dT/dt` settling guidance. | `--t1-r1`, `--t2-r2`, `--t3-r3`, `--pullup`, `--adc-max`, `--temps`, `--limit`, `--output` |
 | `parse-gpio-trace` | Reconstructs bit-level `ODR`/`BSRR`/`BRR` edges, pulse widths, duty cycles, and frequency variances split across a G-code event timestamp. | `--trace`, `--pins`, `--split-time`, `--limit`, `--output` |
 | `analyze-klippy-stats` | Parses `klippy.log` `Stats` lines to compute pre/post `mcu_awake`, `mcu_task_avg`, and heater PWM means + variances. | `--log`, `--split-time`, `--limit`, `--output` |
-| `probe-renode` | Telnet IAC-safe (`0xFF` stripped, `16`-space padded) monitor client for live `ElapsedVirtualTime` and MMIO reads. | `--host`, `--port`, `--commands`, `--samples`, `--interval-ms`, `--limit`, `--output` |
+| `probe-renode` | Telnet IAC-safe (`0xFF` stripped, `16`-space padded) monitor client separating standalone `result_hex_values` from echoed command addresses. | `--host`, `--port`, `--commands`, `--samples`, `--interval-ms`, `--limit`, `--output` |
 | `fetch-datasheet` | Rate-limited (`1.0 req/s`) component datasheet/schematic fetcher with `RateLimitError` and retry backoff. | `--url`, `--dest`, `--limit`, `--output` |
 | `sanitize-audit` | Audits files for leaked OS usernames, hostnames, emails, session UUIDs, and hardware `--deny-terms`. | `--target`, `--limit`, `--output` (optional `--deny-terms`) |
+| `audit-pr-markdown` | Validates PR/comment markdown files against PowerShell backtick corruption (`\ident\`), `0x00` NUL truncation, BOM, and unbalanced code fences. | `--target`, `--limit`, `--output` |
 
 ## Workflow
 
@@ -92,12 +93,13 @@ All automation subcommands live in [`scripts/klipper_hil_cli.py`](./scripts/klip
 - Diff `klippy/extras/heaters.py`, `src/gpiocmds.c`, `src/pwmcmds.c`, `src/generic/armcm_timer.c`, and `src/stm32/` against `origin/master` to separate unrelated upstream changes.
 - Test unpatched vs. minimally patched `klippy` against the **identical** compiled `out/klipper.elf` binary.
 
-### 2. Build Untouched `klipper.elf` for Hardware UART (`CONFIG_SERIAL=y`)
-- Even if the physical printer board uses USB CDC (`CONFIG_USBSERIAL=y`), configure `CONFIG_SERIAL=y` on `USART1`/`USART2`/`USART3` (`250000` baud) when building `out/klipper.elf` for emulation. `klippy/serialqueue.py` runs the exact same CRC-16 binary protocol, `clocksync`, and `trsync` state machine over UART PTYs without requiring a USB host controller model.
+### 2. Build Untouched `klipper.elf` for Direct Boot & Hardware UART (`CONFIG_SERIAL=y`)
+- Even if the physical printer board uses USB CDC (`CONFIG_USBSERIAL=y`) and a bootloader (`0x08002000` / `0x08007000`), configure `CONFIG_LOW_LEVEL_OPTIONS=y`, **`CONFIG_STM32_FLASH_START_0000=y`** (or match `sysbus.cpu VectorTableOffset` to `resolve-armcm-hooks`'s `vector_table_offset`), and **`CONFIG_SERIAL=y`** on `USART1`/`USART2`/`USART3` (`250000` baud). Omitting `FLASH_START_0000` while booting at `0x08000000` halts Cortex-M reset (`PC and SP are equal to zero`) with misleading `usart1: receiver is not enabled` logs.
+- When measuring multi-branch ELF size deltas (`arm-none-eabi-size`), always `git reset --hard origin/master` before each branch checkout to prevent dirty-tree bleed, and apply `test/configs/stm32f042.config` `CONFIG_WANT_*=n` trims on `32 KiB` `STM32F103x6`/`STM32F042` builds.
 - Keep `out/klipper.elf` 100% unpatched—do **not** edit `src/generic/armcm_timer.c` or `src/stm32/` to make the emulator boot.
 
-### 3. Launch Renode with Peripheral Stubs & `armcm_timer` Silicon Hooks
-- Load [`assets/stm32f103_klipper_generic.repl`](./assets/stm32f103_klipper_generic.repl) and [`assets/klipper_hil_session.resc`](./assets/klipper_hil_session.resc). Read [`references/renode-klipper-trials.md`](./references/renode-klipper-trials.md) for all six communication and timer pitfalls:
+### 3. Launch Renode with Peripheral Stubs, Optional `RM0008` I2C1 Overlay & `armcm_timer` Hooks
+- Load [`assets/stm32f103_klipper_generic.repl`](./assets/stm32f103_klipper_generic.repl) (and for STM32 I2Cv1 `CCR`/`TRISE` or `rc_w0` `I2C_SR1_AF` NACK testing, run `sysbus Unregister sysbus.i2c1` followed by [`assets/stm32_rm0008_i2c1_overlay.repl`](./assets/stm32_rm0008_i2c1_overlay.repl)) inside [`assets/klipper_hil_session.resc`](./assets/klipper_hil_session.resc). Read [`references/renode-klipper-trials.md`](./references/renode-klipper-trials.md) for all ten emulation, build, and PowerShell/WSL pitfalls:
   1. Inject the `AddHook` lines from `resolve-armcm-hooks` **before** `start` so `timer_set_diff()` and LTO-inlined `timer_kick()` do not trigger a `Limit=0` `SysTick` IRQ storm.
   2. Provide `RCC` PLL-ready bits, virtual-time `DWT->CYCCNT` (`72 MHz`), and hot-reloadable `ADC1` (`0x40012400`) initialized to ambient/setpoint counts so `klippy` never trips `ADC out of range` at boot.
   3. Set `PerformanceInMips 95` and `SetGlobalQuantum "0.000500"` (`500 µs`), connect `CreateUartPtyTerminal` to `sysbus.usart1`, and wait for `"Starting heater checks"` in `klippy.log` plus `1.5 s` before sending G-code to the `-I <gcode_pty>` input terminal.
@@ -108,10 +110,10 @@ All automation subcommands live in [`scripts/klipper_hil_cli.py`](./scripts/klip
 - Record virtual time right before sending `M104 S0` / `M140 S0`, step cooling ADC values once per second, and run `parse-gpio-trace` + `analyze-klippy-stats`.
 
 ### 5. Cross-Audit Printer Schematics, Auxiliary Pins & Enclosure Acoustics
-- Use [`references/printer-board-hardware-audit.md`](./references/printer-board-hardware-audit.md) to map every active pin and bus load against board schematics:
-  - Distinguish transient heater `MCU_pwm` pulses (`<= 2.1 s` unpatched, `<= 0.3 s` `#7322`-class zero-enforcement) from `[output_pin]` / `[led]` / `[pwm_cycle_time]` channels that keep toggling indefinitely until `SET_PIN VALUE=0` or `FIRMWARE_RESTART`.
-  - Check `mcu_awake` inflation from synchronous `100 kHz` I2C display polling (`src/stm32/i2c.c` `i2c_wait` / `I2C_SR1_AF`), which injects periodic `5 V` buck PFM ripple into piezoelectric output MLCCs and heated-bed enclosure standing-wave cavities (`1.5–4 kHz`).
-- Run `sanitize-audit` before staging any skill, doc, or test fixture into a public fork or upstream PR.
+- Use [`references/printer-board-hardware-audit.md`](./references/printer-board-hardware-audit.md) (including Section 4's **Zero-Heating Cold-Bench `25 °C` Instant Acoustic Reproduction Matrix**) to map every active pin and bus load against board schematics:
+  - Distinguish transient heater `MCU_pwm` pulses (`<= 2.1 s` unpatched, `<= 0.3 s` `#7322`-class zero-enforcement) from `[output_pin]` / `[led]` / `[pwm_cycle_time]` channels (especially `cycle_time: 0.001` `1 kHz` fractional PWM vs silent `VALUE=1.0` DC!) that keep toggling indefinitely until `SET_PIN VALUE=0` or `FIRMWARE_RESTART`.
+  - Check `mcu_awake` inflation and `rc_w0` `I2C_SR1_AF` NACK latch behavior (`src/stm32/i2c.c` `i2c_wait` / `EV8_2` final-byte NACK during `i2c_stop`), as well as `5 V` buck PFM ripple into piezoelectric output MLCCs and heated-bed enclosure standing-wave cavities (`1.5–4 kHz`).
+- Run `sanitize-audit` before staging any skill, doc, or test fixture, and always pass PR/comment texts via UTF-8 files (`--body-file` / `gh api --input`) verified by `audit-pr-markdown` (never PowerShell inline `--body "..."`).
 
 ## Rate Limiting
 
