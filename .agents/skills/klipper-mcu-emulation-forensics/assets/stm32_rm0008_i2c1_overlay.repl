@@ -1,0 +1,202 @@
+# STM32 RM0008 I2Cv1 (src/stm32/i2c.c) Cycle- & Register-Accurate Fault-Injection Overlay (.repl)
+# Load AFTER `sysbus Unregister sysbus.i2c1` in your .resc script.
+# Models:
+#   - CR2 (PCLK1 MHz), CCR (100kHz Sm vs 400kHz Fm I2C_CCR_FS), TRISE
+#   - Physical t_HD;STA START generation delay (4.0 us Sm / 0.8 us Fm) before SB=1 & SR2.MSL=1
+#   - RM0008 Section 26.6.6 rc_w0 error flags in SR1 (I2C_SR1_AF = 0x0400 cleared ONLY by writing 0 or PE=0)
+#   - One-shot fault injection via /tmp/klipper_hil_i2c_fault.txt ("ADDR_NACK" or "FINAL_DATA_NACK" EV8_2)
+
+i2c1_hw: Python.PythonPeripheral @ sysbus 0x40005400
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    import clr
+    import os
+    em = Antmicro.Renode.Core.EmulationManager.Instance
+    cr1 = 0
+    cr2 = 0
+    dr = 0
+    sr1 = 0
+    sr2 = 0
+    ccr = 0
+    trise = 0
+    sr1_read_while_sb = False
+    sr1_read_while_addr = False
+    start_ready_t = -1.0
+    addr_ready_t = -1.0
+    byte_nack_ready_t = -1.0
+    rx_ready_t = -1.0
+    cur_addr = 0
+    tx_bytes = []
+    rx_queue = [0xBE, 0xEF]
+    addr_fault = ""
+    pending_data_fault = ""
+
+    def log_ev(t_s, msg):
+        f = open("/tmp/klipper_i2c1_trace.log", "a")
+        f.write(("%.6f %s" % (t_s, msg)) + chr(10))
+        f.close()
+
+    def pop_fault_rule():
+        fault_path = "/tmp/klipper_hil_i2c_fault.txt"
+        if not os.path.exists(fault_path):
+            return ""
+        try:
+            f = open(fault_path, "r")
+            mode = f.read().strip()
+            f.close()
+            if mode:
+                f2 = open(fault_path, "w")
+                f2.write("")
+                f2.close()
+            return mode
+        except OSError as err:
+            self.Log(LogLevel.Warning, "I2C fault stimulus read error: %s" % str(err))
+            return ""
+
+    def step_hw(t_s):
+        global cr1, sr1, sr2, start_ready_t, addr_ready_t, byte_nack_ready_t, rx_ready_t
+        if start_ready_t >= 0.0 and t_s >= start_ready_t:
+            start_ready_t = -1.0
+            cr1 &= ~0x0100
+            sr1 |= 0x0001
+            sr2 |= 0x0003
+            log_ev(t_s, "HW_START_DONE SR1=0x%04x SR2=0x%04x" % (sr1, sr2))
+        if addr_ready_t >= 0.0 and t_s >= addr_ready_t:
+            mode = addr_fault
+            addr_ready_t = -1.0
+            if mode == "ADDR_NACK":
+                sr1 |= 0x0400
+                log_ev(t_s, "HW_ADDR_NACK addr=0x%02x SR1=0x%04x SR2=0x%04x" % (cur_addr, sr1, sr2))
+            else:
+                sr1 |= 0x0002
+                if (cur_addr & 1) == 0:
+                    sr2 |= 0x0004
+                else:
+                    sr2 &= ~0x0004
+                log_ev(t_s, "HW_ADDR_ACK addr=0x%02x SR1=0x%04x SR2=0x%04x" % (cur_addr, sr1, sr2))
+        if byte_nack_ready_t >= 0.0 and t_s >= byte_nack_ready_t:
+            byte_nack_ready_t = -1.0
+            sr1 = (sr1 & ~0x0080) | 0x0400
+            if cr1 & 0x0200:
+                cr1 &= ~0x0200
+                sr2 &= ~0x0007
+            log_ev(t_s, "HW_DATA_NACK SR1=0x%04x SR2=0x%04x" % (sr1, sr2))
+        if rx_ready_t >= 0.0 and t_s >= rx_ready_t:
+            rx_ready_t = -1.0
+            sr1 |= 0x0040
+            log_ev(t_s, "HW_RXNE SR1=0x%04x" % sr1)
+
+elif request.isRead:
+    t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+    step_hw(t_sec)
+    off = request.offset
+    if off == 0x00:
+        request.value = cr1
+    elif off == 0x04:
+        request.value = cr2
+    elif off == 0x10:
+        sr1 &= ~0x0040
+        val = rx_queue.pop(0) if rx_queue else 0xA5
+        rx_queue.append(val)
+        request.value = val
+    elif off == 0x14:
+        if sr1 & 0x0001:
+            sr1_read_while_sb = True
+        if sr1 & 0x0002:
+            sr1_read_while_addr = True
+        request.value = sr1
+    elif off == 0x18:
+        if sr1_read_while_addr:
+            sr1_read_while_addr = False
+            sr1 &= ~0x0002
+            if sr2 & 0x0004:
+                sr1 |= 0x0080
+            else:
+                bit_us = 0.0000025 if (ccr & 0x8000) else 0.000010
+                rx_ready_t = t_sec + 9.0 * bit_us
+        request.value = sr2
+    elif off == 0x1C:
+        request.value = ccr
+    elif off == 0x20:
+        request.value = trise
+    else:
+        request.value = 0
+
+elif request.isWrite:
+    t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+    step_hw(t_sec)
+    off = request.offset
+    v = request.value & 0xFFFF
+    if off == 0x00:
+        if (v & 0x8000) or ((v & 0x0001) == 0):
+            cr1 = v & 0x8000
+            sr1 = 0
+            sr2 = 0
+            start_ready_t = -1.0
+            addr_ready_t = -1.0
+            byte_nack_ready_t = -1.0
+            rx_ready_t = -1.0
+            log_ev(t_sec, "WR_CR1_RESET v=0x%04x" % v)
+        else:
+            cr1 = v
+            if v & 0x0100:
+                sr1 &= ~0x0080
+                t_hd_sta = 0.0000008 if (ccr & 0x8000) else 0.0000040
+                start_ready_t = t_sec + t_hd_sta
+                tx_bytes = []
+                log_ev(t_sec, "WR_CR1_START CR1=0x%04x SR1=0x%04x SR2=0x%04x" % (cr1, sr1, sr2))
+            if v & 0x0200:
+                if byte_nack_ready_t < 0.0:
+                    cr1 &= ~0x0200
+                    sr1 &= ~0x0080
+                    sr2 &= ~0x0007
+                log_ev(t_sec, "WR_CR1_STOP CR1=0x%04x SR1=0x%04x SR2=0x%04x tx=%s" % (cr1, sr1, sr2, tx_bytes))
+    elif off == 0x04:
+        cr2 = v
+        log_ev(t_sec, "WR_CR2=%d (0x%04x)" % (v, v))
+    elif off == 0x10:
+        dr = v & 0xFF
+        bit_us = 0.0000025 if (ccr & 0x8000) else 0.000010
+        if sr1_read_while_sb and (sr1 & 0x0001):
+            sr1_read_while_sb = False
+            sr1 &= ~0x0001
+            cur_addr = dr
+            f_rule = pop_fault_rule()
+            if cur_addr == 0x48 or f_rule == "ADDR_NACK":
+                addr_fault = "ADDR_NACK"
+                pending_data_fault = ""
+            elif f_rule == "FINAL_DATA_NACK":
+                addr_fault = ""
+                pending_data_fault = "FINAL_DATA_NACK"
+            else:
+                addr_fault = ""
+                pending_data_fault = ""
+            addr_ready_t = t_sec + 9.0 * bit_us
+            log_ev(t_sec, "WR_DR_ADDR=0x%02x fault=%s" % (cur_addr, addr_fault or pending_data_fault or "NONE"))
+        elif (sr2 & 0x0001) == 0:
+            log_ev(t_sec, "WR_DR_IGNORED_NOT_MASTER val=0x%02x SR1=0x%04x SR2=0x%04x" % (dr, sr1, sr2))
+        else:
+            tx_bytes.append(dr)
+            if pending_data_fault == "FINAL_DATA_NACK":
+                pending_data_fault = ""
+                sr1 |= 0x0080
+                byte_nack_ready_t = t_sec + 9.0 * bit_us
+                log_ev(t_sec, "WR_DR_DATA_WILL_NACK=0x%02x" % dr)
+            else:
+                sr1 |= 0x0080
+                log_ev(t_sec, "WR_DR_DATA=0x%02x" % dr)
+    elif off == 0x14:
+        rc_w0_mask = 0xDF00
+        clear_bits = (~v) & rc_w0_mask
+        old_sr1 = sr1
+        sr1 &= ~clear_bits
+        log_ev(t_sec, "WR_SR1 v=0x%04x old_SR1=0x%04x new_SR1=0x%04x" % (v, old_sr1, sr1))
+    elif off == 0x1C:
+        ccr = v
+        log_ev(t_sec, "WR_CCR=0x%04x (FS=%d DUTY=%d CCR_VAL=%d)" % (v, (v >> 15) & 1, (v >> 14) & 1, v & 0x0FFF))
+    elif off == 0x20:
+        trise = v
+        log_ev(t_sec, "WR_TRISE=%d (0x%04x)" % (v, v))
+'''

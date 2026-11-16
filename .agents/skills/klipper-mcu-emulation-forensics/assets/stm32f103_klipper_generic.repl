@@ -105,11 +105,11 @@ elif request.isWrite:
     if request.offset in (0x34, 0x38, 0x3c, 0x40, 0x20, 0x2c, 0x00):
         t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
         f = open("/tmp/klipper_tim3_trace.log", "a")
-        f.write("%.6f TIM3[0x%02x]=0x%04x (PSC=%d ARR=%d CCR1=%d CCR2=%d CCR3=%d CCR4=%d CCER=0x%04x)\n" % (
+        f.write(("%.6f TIM3[0x%02x]=0x%04x (PSC=%d ARR=%d CCR1=%d CCR2=%d CCR3=%d CCR4=%d CCER=0x%04x)" % (
             t_sec, request.offset, request.value,
             regs.get(0x28, 0), regs.get(0x2c, 0),
             regs.get(0x34, 0), regs.get(0x38, 0), regs.get(0x3c, 0), regs.get(0x40, 0),
-            regs.get(0x20, 0)))
+            regs.get(0x20, 0))) + chr(10))
         f.close()
 '''
 

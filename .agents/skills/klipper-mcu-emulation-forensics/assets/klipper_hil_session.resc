@@ -10,8 +10,16 @@
 logFile @/tmp/klipper_renode.log
 mach create "klipper_stm32_hil"
 machine LoadPlatformDescription @.agents/skills/klipper-mcu-emulation-forensics/assets/stm32f103_klipper_generic.repl
+
+# Optional: To test STM32 RM0008 I2Cv1 CCR/TRISE timings and rc_w0 I2C_SR1_AF NACK recovery,
+# unregister the stock happy-path i2c1 model BEFORE loading the fault-injectable overlay:
+# sysbus Unregister sysbus.i2c1
+# machine LoadPlatformDescription @.agents/skills/klipper-mcu-emulation-forensics/assets/stm32_rm0008_i2c1_overlay.repl
+
 sysbus LoadELF @out/klipper.elf
 
+# Must match CONFIG_FLASH_BOOT_ADDRESS in .config (0x08000000 for CONFIG_STM32_FLASH_START_0000=y,
+# 0x08002000 for 8KiB bootloader, 0x08007000 for 28KiB bootloader; auto-emitted by resolve-armcm-hooks):
 sysbus.cpu VectorTableOffset 0x08000000
 sysbus.cpu PerformanceInMips 95
 emulation SetGlobalQuantum "0.000500"
@@ -19,10 +27,10 @@ emulation SetGlobalQuantum "0.000500"
 emulation CreateUartPtyTerminal "klipper_uart" "/tmp/klipper_mcu_pty" true
 connector Connect sysbus.usart1 klipper_uart
 
-# Capture every 1 us GPIO ODR (0x0C), BSRR (0x10), and BRR (0x14) bus write
-sysbus SetHookBeforePeripheralWrite sysbus.gpioPortC "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f C 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
-sysbus SetHookBeforePeripheralWrite sysbus.gpioPortB "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f B 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
-sysbus SetHookBeforePeripheralWrite sysbus.gpioPortA "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write('%.6f A 0x%02x 0x%08x\n' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))); f.close()"
+# Capture every 1 us GPIO ODR (0x0C), BSRR (0x10), and BRR (0x14) bus write (use chr(10), never literal \n!)
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortC "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write(('%.6f C 0x%02x 0x%08x' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))) + chr(10)); f.close()"
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortB "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write(('%.6f B 0x%02x 0x%08x' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))) + chr(10)); f.close()"
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortA "if int(offset) in (0x0c, 0x10, 0x14): f = open('/tmp/klipper_gpio_trace.log', 'a'); f.write(('%.6f A 0x%02x 0x%08x' % (machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds, int(offset), int(value))) + chr(10)); f.close()"
 
 # Paste `resolve-armcm-hooks` output lines right here BEFORE `start`:
 # sysbus.cpu AddHook 0x0800xxxx "self.SetRegisterUlong(...)"

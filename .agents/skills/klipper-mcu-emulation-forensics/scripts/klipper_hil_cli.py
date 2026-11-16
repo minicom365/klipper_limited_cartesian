@@ -225,6 +225,10 @@ def resolve_armcm_hooks(elf_path: str, objdump_bin: str, limit: int) -> dict[str
     if not parsed:
         raise RuntimeError(f"No disassembled instructions parsed from {elf_file}")
 
+    # Auto-detect ELF flash load / vector table base (e.g. 0x08000000 vs 0x08002000 8KiB / 0x08007000 28KiB bootloader)
+    min_code_addr = min(ins["addr"] for ins in parsed)
+    vector_table_offset = min_code_addr & ~0x7FF
+
     hooks: list[dict[str, Any]] = []
     truncated = False
 
@@ -310,14 +314,25 @@ def resolve_armcm_hooks(elf_path: str, objdump_bin: str, limit: int) -> dict[str
             truncated = True
             break
 
+    resc_lines = [f"sysbus.cpu VectorTableOffset 0x{vector_table_offset:08x}"] + [h["resc_command"] for h in hooks]
     return {
         "elf_path": str(elf_file),
+        "vector_table_offset": f"0x{vector_table_offset:08x}",
+        "bootloader_offset_warning": (
+            None
+            if vector_table_offset == 0x08000000
+            else (
+                f"ELF links at 0x{vector_table_offset:08x} (bootloader offset enabled). "
+                f"Set 'sysbus.cpu VectorTableOffset 0x{vector_table_offset:08x}' in .resc or rebuild with "
+                "CONFIG_STM32_FLASH_START_0000=y to avoid Renode 'PC and SP are equal to zero' CPU halt."
+            )
+        ),
         "total_instructions_scanned": len(parsed),
         "hooks_found": len(hooks),
         "truncated_by_limit": truncated,
         "limit": limit,
         "hooks": hooks,
-        "resc_snippet": "\n".join(h["resc_command"] for h in hooks),
+        "resc_snippet": "\n".join(resc_lines),
     }
 
 
@@ -740,12 +755,16 @@ def probe_renode(
 
             for idx in range(capped_samples):
                 t_wall = time.monotonic()
+                cmd_count = max(1, len([c for c in commands.split(";") if c.strip()]))
+                min_wait = max(0.08, 0.06 * cmd_count)
                 payload = (" " * 16 + commands.strip() + "\r\n").encode("utf-8")
                 sock.sendall(payload)
-                time.sleep(max(0.05, interval_ms / 1000.0))
+                time.sleep(max(min_wait, interval_ms / 1000.0))
 
                 raw_reply = _drain_socket_bytes(sock)
                 decoded = strip_telnet_iac(raw_reply).decode("utf-8", errors="replace").strip()
+                # Standalone result lines (e.g. "0x000000B4") exclude echoed command addresses ("ReadDoubleWord 0x4000541C")
+                result_hex_vals = re.findall(r"(?m)^\s*(0x[0-9A-Fa-f]+)\s*$", decoded)
                 hex_vals = re.findall(r"0x[0-9A-Fa-f]+", decoded)
                 vt_match = re.search(r"Elapsed Virtual Time:\s*([0-9:.]+)", decoded)
                 records.append(
@@ -753,6 +772,7 @@ def probe_renode(
                         "sample_index": idx,
                         "monotonic_sec": round(t_wall, 6),
                         "virtual_time": vt_match.group(1) if vt_match else None,
+                        "result_hex_values": result_hex_vals,
                         "hex_tokens": hex_vals,
                         "raw_response": decoded,
                     }
@@ -868,6 +888,84 @@ def sanitize_audit(target_path: str, deny_terms_csv: str, limit: int) -> tuple[d
     return report, (0 if len(findings) == 0 else 1)
 
 
+def audit_pr_markdown(target_path: str, limit: int) -> tuple[dict[str, Any], int]:
+    """Audit PR/comment markdown files for PowerShell/shell escaping corruption (\\ident\\, NUL truncation, unbalanced backticks, BOM/mojibake)."""
+    if limit <= 0:
+        raise ValueError("--limit must be a positive integer")
+    root = Path(target_path).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Markdown audit target does not exist: {root}")
+
+    files = [root] if root.is_file() else sorted(p for p in root.rglob("*.md") if p.is_file())
+    findings: list[dict[str, Any]] = []
+    truncated = False
+
+    def add_finding(rel_name: str, kind: str, detail: Any) -> bool:
+        nonlocal truncated
+        findings.append({"file": rel_name, "type": kind, "detail": detail})
+        if len(findings) >= limit:
+            truncated = True
+            return True
+        return False
+
+    for fpath in files:
+        raw_bytes = fpath.read_bytes()
+        rel_name = fpath.name if root.is_file() else str(fpath.relative_to(root)).replace("\\", "/")
+        if raw_bytes.startswith(b"\xef\xbb\xbf"):
+            if add_finding(rel_name, "utf8_bom_present", "File starts with UTF-8 BOM (EF BB BF)"):
+                break
+        text = raw_bytes.decode("utf-8", errors="replace")
+        if "\ufffd" in text:
+            if add_finding(rel_name, "unicode_replacement_char", "Contains U+FFFD mojibake"):
+                break
+
+        ctrl = [hex(ord(ch)) for ch in text if ord(ch) < 32 and ch not in ("\r", "\n", "\t")]
+        if ctrl:
+            if add_finding(rel_name, "control_character_or_nul", ctrl[:10]):
+                break
+
+        fence_count = len(re.findall(r"^```", text, flags=re.MULTILINE))
+        if fence_count % 2 != 0:
+            if add_finding(rel_name, "unbalanced_code_fence", f"fence_count={fence_count}"):
+                break
+
+        without_fences = re.sub(r"```[\s\S]*?```", "", text)
+        if text.rstrip().endswith("\\"):
+            if add_finding(rel_name, "trailing_backslash_truncation", text[-80:]):
+                break
+
+        for p_idx, para in enumerate(re.split(r"\r?\n\r?\n", without_fences), start=1):
+            # Remove valid multi-backtick (`` ... ``) and single-backtick (` ... `) code spans; any leftover ` is unbalanced
+            leftover_ticks = re.sub(r"(``+)[^\r\n]*?\1|`[^`\r\n]+`", "", para)
+            if "`" in leftover_ticks:
+                if add_finding(rel_name, "unbalanced_inline_backticks", f"paragraph {p_idx} has unmatched backtick"):
+                    break
+        if truncated:
+            break
+
+        # Strip inline code spans and inline LaTeX ($...$) before checking prose for PowerShell \ident\ or `n/`0 corruption
+        prose_only = re.sub(r"(``+)[^\r\n]*?\1|`[^`\r\n]+`|\$[^$\r\n]+\$", "", without_fences)
+        bs_tokens = re.findall(r"\\[A-Za-z0-9_#().-]+\\", prose_only)
+        if bs_tokens:
+            if add_finding(rel_name, "powershell_backslash_wrapped_token", bs_tokens[:10]):
+                break
+
+        stray_ps = re.findall(r"`[nrt0]\b", prose_only)
+        if stray_ps:
+            if add_finding(rel_name, "stray_powershell_backtick_escape", stray_ps[:10]):
+                break
+
+    report = {
+        "status": "PASS" if len(findings) == 0 else "FAIL",
+        "files_scanned": len(files),
+        "total_findings": len(findings),
+        "truncated_by_limit": truncated,
+        "limit": limit,
+        "findings": findings,
+    }
+    return report, (0 if len(findings) == 0 else 1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Klipper MCU Emulation & Hardware Schematic Forensics CLI (stdlib-only)"
@@ -924,6 +1022,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_san.add_argument("--limit", type=int, required=True, help="Maximum findings to record")
     p_san.add_argument("--output", required=True, help="Output JSON audit report path")
 
+    p_prmd = sub.add_parser("audit-pr-markdown", help="Audit PR/comment markdown files for PowerShell backtick/NUL corruption")
+    p_prmd.add_argument("--target", required=True, help="Markdown file or directory path to validate")
+    p_prmd.add_argument("--limit", type=int, required=True, help="Maximum findings to record")
+    p_prmd.add_argument("--output", required=True, help="Output JSON audit report path")
+
     return parser
 
 
@@ -979,6 +1082,15 @@ def main() -> None:
             if exit_code != 0:
                 print(
                     f"Sanitization audit FAILED with {report['total_findings']} finding(s). Inspect {args.output}.",
+                    file=sys.stderr,
+                )
+                sys.exit(exit_code)
+        elif args.command == "audit-pr-markdown":
+            report, exit_code = audit_pr_markdown(args.target, args.limit)
+            write_json_output(report, args.output)
+            if exit_code != 0:
+                print(
+                    f"PR markdown audit FAILED with {report['total_findings']} finding(s). Inspect {args.output}.",
                     file=sys.stderr,
                 )
                 sys.exit(exit_code)
