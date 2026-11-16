@@ -1,0 +1,123 @@
+# Generic STM32F103 Klipper MCU Emulation Platform Description (.repl)
+# Extends Renode's built-in stm32f103.repl with:
+#   1. RCC HSE/PLL lock & SYSCLK switch ready bits required by Klipper src/stm32/stm32f1.c
+#   2. 72 MHz virtual-time DWT->CYCCNT counter required by src/generic/armcm_timer.c
+#   3. Hot-reloadable 12-bit ADC1 stimulus peripheral (/tmp/klipper_hil_adc.txt) for thermistor pins
+#   4. TIM3 hardware PWM register logger & IWDG/AFIO/FLASH memory stubs
+
+using "platforms/cpus/stm32f103.repl"
+
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    regs = {0x00: 0x03020083, 0x04: 0x00000000, 0x14: 0, 0x18: 0, 0x1c: 0}
+elif request.isRead:
+    request.value = regs.get(request.offset, 0)
+elif request.isWrite:
+    v = request.value
+    if request.offset == 0x00:
+        if v & (1 << 16):
+            v |= (1 << 17)
+        if v & (1 << 24):
+            v |= (1 << 25)
+    elif request.offset == 0x04:
+        sw = v & 0x3
+        v = (v & ~0xC) | (sw << 2)
+    regs[request.offset] = v
+'''
+
+dwt: Python.PythonPeripheral @ sysbus 0xE0001000
+    size: 0x100
+    initable: true
+    script: '''
+if request.isInit:
+    import clr
+    em = Antmicro.Renode.Core.EmulationManager.Instance
+    ctrl = 0
+    base_cycles = 0
+elif request.isRead:
+    if request.offset == 0x00:
+        request.value = ctrl
+    elif request.offset == 0x04:
+        t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+        cyc = (int(t_sec * 72000000.0) - base_cycles) & 0xFFFFFFFF
+        request.value = cyc
+    else:
+        request.value = 0
+elif request.isWrite:
+    if request.offset == 0x00:
+        ctrl = request.value
+    elif request.offset == 0x04:
+        t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+        base_cycles = (int(t_sec * 72000000.0) - request.value) & 0xFFFFFFFF
+'''
+
+adc1: Python.PythonPeripheral @ sysbus 0x40012400
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    import os
+    regs = {0x00: 0x00, 0x08: 0x00, 0x34: 0, 0x4c: 3980}
+    chan_vals = {0: 3980, 13: 3980, 16: 1750}
+    read_counter = 0
+elif request.isRead:
+    if request.offset == 0x4c:
+        read_counter += 1
+        if read_counter % 4 == 1 and os.path.exists("/tmp/klipper_hil_adc.txt"):
+            try:
+                f = open("/tmp/klipper_hil_adc.txt", "r")
+                txt = f.read().strip()
+                f.close()
+                for part in txt.split(","):
+                    if "=" in part:
+                        k, val_s = part.split("=")
+                        chan_vals[int(k.strip())] = int(val_s.strip())
+            except (OSError, ValueError) as err:
+                self.Log(LogLevel.Warning, "ADC stimulus reload error: %s" % str(err))
+        ch = regs.get(0x34, 0) & 0x1F
+        request.value = chan_vals.get(ch, 3980)
+    else:
+        request.value = regs.get(request.offset, 0)
+elif request.isWrite:
+    v = request.value
+    if request.offset == 0x08:
+        v &= ~0x0C
+        if v & (1 << 22):
+            regs[0x00] = 0x12
+    regs[request.offset] = v
+'''
+
+tim3: Python.PythonPeripheral @ sysbus 0x40000400
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    import clr
+    em = Antmicro.Renode.Core.EmulationManager.Instance
+    regs = {}
+elif request.isRead:
+    request.value = regs.get(request.offset, 0)
+elif request.isWrite:
+    regs[request.offset] = request.value
+    if request.offset in (0x34, 0x38, 0x3c, 0x40, 0x20, 0x2c, 0x00):
+        t_sec = em.CurrentEmulation.Machines[0].LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+        f = open("/tmp/klipper_tim3_trace.log", "a")
+        f.write("%.6f TIM3[0x%02x]=0x%04x (PSC=%d ARR=%d CCR1=%d CCR2=%d CCR3=%d CCR4=%d CCER=0x%04x)\n" % (
+            t_sec, request.offset, request.value,
+            regs.get(0x28, 0), regs.get(0x2c, 0),
+            regs.get(0x34, 0), regs.get(0x38, 0), regs.get(0x3c, 0), regs.get(0x40, 0),
+            regs.get(0x20, 0)))
+        f.close()
+'''
+
+iwdg: Memory.ArrayMemory @ sysbus 0x40003000
+    size: 0x400
+
+afio: Memory.ArrayMemory @ sysbus 0x40010000
+    size: 0x400
+
+flash_ctrl: Memory.ArrayMemory @ sysbus 0x40022000
+    size: 0x400
