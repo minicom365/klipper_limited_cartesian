@@ -3,23 +3,53 @@
 # Copyright (C) 2016-2018  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, math
+# [EN] Integrates pure-stdlib 1D DualLayerMAD v1.2.1 (Twin-Adjacent-Shell
+# point-mass debiasing + 4-step truncated/mixture fixed-point) for ClockSync
+# jitter variance, excluding NumPy/multidimensional estimators for <20us RT.
+# [KO] ClockSync 예측 분산 추정에 순수 표준라이브러리 1D DualLayerMAD v1.2.1
+# (점질량 편향 보정 및 4단계 절단·혼합 고정점 보정)을 결합하며, 20us 미만 실시간성
+# 보장을 위해 외부 NumPy 및 다차원 추정기 의존성을 배제함.
+import bisect, logging, math
+from typing import List, Tuple
 
 RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
 class DualLayerMAD:
-    def __init__(self, window_size=32):
-        self.window_size = window_size
-        self.history = []
+    """
+    [EN] Real-time streaming Dual-Layer MAD noise estimator immune to
+    sudden step-edges via point-symmetry warmup and two-tier filtering.
 
-    def update(self, value):
-        self.history.append(value)
+    [KO] 점대칭 반사 웜업과 2단계 이상치 필터링을 통해 급격한 스텝 에지나
+    데이터 꺾임에 강건한 실시간 스트리밍 2중 MAD 노이즈 추정기.
+    """
+    __slots__ = ('window_size', 'history')
+
+    def __init__(self, window_size: int = 32):
+        if window_size < 4:
+            raise ValueError("window_size must be at least 4.")
+        self.window_size = int(window_size)
+        self.history: List[float] = []
+
+    def reset(self) -> None:
+        """Reset the internal history buffer."""
+        self.history.clear()
+
+    def update(self, value: float) -> None:
+        """
+        [EN] Push a new scalar observation into the rolling window.
+        [KO] 새로운 스칼라 관측값을 롤링 윈도우에 추가.
+        """
+        self.history.append(float(value))
         if len(self.history) > self.window_size:
             self.history.pop(0)
 
-    def get_variance(self):
+    def get_std(self) -> float:
+        """
+        [EN] Estimate robust standard deviation (sigma) of noise background.
+        [KO] 노이즈 배경의 강건한 절단 정규분포 보정 표준편차(sigma) 추정.
+        """
         if not self.history:
             return 0.0
 
@@ -33,34 +63,15 @@ class DualLayerMAD:
         else:
             sample_set = self.history
 
-        n = len(sample_set)
-        if n < 2:
-            return 0.0
+        return _dual_mad_std_from_list(sample_set)
 
-        sorted_history = sorted(sample_set)
-        med = sorted_history[n // 2]
-        abs_devs = [abs(x - med) for x in sample_set]
-        sorted_abs_devs = sorted(abs_devs)
-        mad1 = sorted_abs_devs[n // 2]
-        if mad1 == 0:
-            return 0.0
-
-        threshold = 2.5 * mad1
-        candidates = [
-            x for x, dev in zip(sample_set, abs_devs) if dev <= threshold
-        ]
-
-        c_len = len(candidates)
-        if c_len < 2:
-            return mad1 * 1.4826
-
-        sorted_candidates = sorted(candidates)
-        pure_med = sorted_candidates[c_len // 2]
-
-        pure_abs_devs = sorted([abs(x - pure_med) for x in candidates])
-        pure_mad = pure_abs_devs[c_len // 2]
-
-        return pure_mad * 1.4826
+    def get_variance(self) -> float:
+        """
+        [EN] Estimate robust noise variance (sigma^2).
+        [KO] 노이즈 배경의 강건한 분산(sigma^2) 추정.
+        """
+        s = self.get_std()
+        return s * s
 
 class ClockSync:
     def __init__(self, reactor):
@@ -138,13 +149,14 @@ class ClockSync:
                          sent_time, old_freq, clock - exp_clock,
                          math.sqrt(self.prediction_variance))
             self.prediction_variance = (.001 * self.mcu_freq)**2
+            self.dlmad.reset()
         else:
             self.last_prediction_time = sent_time
-            # Inject DLMAD for variance calculation
+            # Inject DLMAD v1.2.1 for unbiased variance calculation
             self.dlmad.update(clock - exp_clock)
-            dlmad_var = self.dlmad.get_variance()
-            if dlmad_var >= 1.0:
-                self.prediction_variance = dlmad_var**2
+            dlmad_std = self.dlmad.get_std()
+            if dlmad_std >= 1.0:
+                self.prediction_variance = dlmad_std * dlmad_std
             else:
                 self.prediction_variance = (
                     (1. - DECAY) * (
@@ -292,3 +304,143 @@ class SecondarySync(ClockSync):
         self.clock_adj = (adjusted_offset, adjusted_freq)
         self.last_sync_time = sync2_print_time
         return self.clock_adj
+
+
+_SQRT2 = 1.4142135623730951
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+
+_INV_SQRT2PI = 0.3989422804014327
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) * _INV_SQRT2PI
+
+def _norm_ppf(p: float) -> float:
+    z = 0.0
+    for _ in range(6):
+        err = _norm_cdf(z) - p
+        pdf = _norm_pdf(z)
+        z -= err / (pdf + 0.5 * z * err)
+    return z
+
+_Z75 = _norm_ppf(0.75)
+
+_C_GAUSS = 1.0 / _Z75
+
+def _debias_mad1_point_mass(mad1: float, p0_hat: float) -> float:
+    if p0_hat <= 0.0:
+        return mad1
+    p_eff = p0_hat if p0_hat < 0.49 else 0.49
+    z_zi = _norm_ppf(1.0 - 0.25 / (1.0 - p_eff))
+    return mad1 * (_Z75 / z_zi)
+
+def _excess_point_mass_list(
+    sorted_devs: List[float], tol: float
+) -> Tuple[int, float]:
+    n = len(sorted_devs)
+    first_gt = bisect.bisect_right(sorted_devs, tol)
+    if first_gt < 2 or first_gt >= n:
+        return first_gt, 0.0
+    nz_cnt = n - first_gt
+    ref_off = min(nz_cnt - 1, min(3, nz_cnt // 150))
+    d_ref = sorted_devs[first_gt + ref_off]
+    n1 = bisect.bisect_right(sorted_devs, 1.5 * d_ref, first_gt, n) - first_gt
+    if 2 * n1 >= first_gt:
+        return first_gt, 0.0
+    return first_gt, float(first_gt) / float(n)
+
+def _median_sorted_range(s: List[float], offset: int, count: int) -> float:
+    mid = offset + (count >> 1)
+    if count & 1:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+def _median_sorted(s: List[float]) -> float:
+    return _median_sorted_range(s, 0, len(s))
+
+_C0_TAU25 = 2.5 * _Z75
+
+_Q0_TAU25 = _norm_ppf(0.25 + 0.5 * _norm_cdf(_C0_TAU25))
+
+def _truncated_mad_fixed_point(mad2: float, r1: float) -> float:
+    sig = mad2 / _Q0_TAU25
+    r1_floor = 1e-12 * max(r1, 1.0)
+    for _ in range(4):
+        c_eff = max(_C0_TAU25, r1 / max(sig, r1_floor))
+        sig = mad2 / _norm_ppf(0.25 + 0.5 * _norm_cdf(c_eff))
+    return sig
+
+def _mixture_mad_fixed_point(mad2: float, r1: float, p0_in: float) -> float:
+    if p0_in <= 0.0:
+        return _truncated_mad_fixed_point(mad2, r1)
+    w_in = (1.0 - 2.0 * p0_in) / (4.0 * (1.0 - p0_in))
+    sig = mad2 / _norm_ppf(0.5 + w_in * (2.0 * _norm_cdf(_C0_TAU25) - 1.0))
+    r1_floor = 1e-12 * max(r1, 1.0)
+    for _ in range(4):
+        c_eff = max(_C0_TAU25, r1 / max(sig, r1_floor))
+        sig = mad2 / _norm_ppf(0.5 + w_in * (2.0 * _norm_cdf(c_eff) - 1.0))
+    return sig
+
+def _dual_mad_std_from_list(sample_set: List[float]) -> float:
+    n = len(sample_set)
+    if n < 2:
+        return 0.0
+
+    sorted_history = sorted(sample_set)
+    rng = sorted_history[-1] - sorted_history[0]
+    if math.isnan(rng):
+        return float("nan")
+    if rng <= 0.0:
+        return 0.0
+
+    tol = 1e-12 * rng
+    min_nz = 2 if n < 16 else max(3, n // 20)
+    med = _median_sorted(sorted_history)
+    abs_devs = [abs(x - med) for x in sample_set]
+    sorted_abs_devs = sorted(abs_devs)
+    mad1 = _median_sorted(sorted_abs_devs)
+    first_gt, p0_hat = _excess_point_mass_list(sorted_abs_devs, tol)
+
+    if mad1 <= tol or (first_gt * 2 >= n) or p0_hat >= 0.49:
+        nz_count = n - first_gt
+        if nz_count < min_nz:
+            return 0.0
+        eff_mad1 = _median_sorted_range(sorted_abs_devs, first_gt, nz_count)
+        r1 = 2.5 * eff_mad1
+        nzi_end = bisect.bisect_right(sorted_abs_devs, r1, first_gt, n)
+        nzi_count = nzi_end - first_gt
+        if nzi_count < 2:
+            return eff_mad1 * _C_GAUSS
+        nzi_mad = _median_sorted_range(sorted_abs_devs, first_gt, nzi_count)
+        return _truncated_mad_fixed_point(nzi_mad, r1)
+
+    # Level 1: Zero-inflation-debiased step-edge & outlier gate (50% breakdown)
+    mad1_eff = _debias_mad1_point_mass(mad1, p0_hat)
+    r1 = 2.5 * mad1_eff
+    candidates = [
+        x for x, dev in zip(sample_set, abs_devs) if dev <= r1
+    ]
+
+    c_len = len(candidates)
+    if c_len < 2:
+        return mad1_eff * _C_GAUSS
+
+    # Level 2: Pure noise deviation estimation on filtered inliers
+    sorted_candidates = sorted(candidates)
+    pure_med = _median_sorted(sorted_candidates)
+
+    pure_abs_devs = sorted(abs(x - pure_med) for x in candidates)
+    pure_mad = _median_sorted(pure_abs_devs)
+    first_gt2, p0_in = _excess_point_mass_list(pure_abs_devs, tol)
+
+    if pure_mad <= tol or (first_gt2 * 2 >= c_len) or p0_in >= 0.35:
+        nz_pure_count = c_len - first_gt2
+        if nz_pure_count < min_nz:
+            return 0.0
+        pure_mad_nz = _median_sorted_range(
+            pure_abs_devs, first_gt2, nz_pure_count
+        )
+        return _truncated_mad_fixed_point(pure_mad_nz, r1)
+
+    return _mixture_mad_fixed_point(pure_mad, r1, p0_in)
