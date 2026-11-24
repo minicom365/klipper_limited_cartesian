@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Micro-controller clock synchronization
 #
 # Copyright (C) 2016-2018  Kevin O'Connor <kevin@koconnor.net>
@@ -10,13 +11,12 @@
 # (점질량 편향 보정 및 4단계 절단·혼합 고정점 보정)을 결합하며, 20us 미만 실시간성
 # 보장을 위해 외부 NumPy 및 다차원 추정기 의존성을 배제함.
 import bisect, logging, math
-from typing import List, Tuple
 
 RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
-class DualLayerMAD:
+class DualLayerMAD(object):
     """
     [EN] Real-time streaming Dual-Layer MAD noise estimator immune to
     sudden step-edges via point-symmetry warmup and two-tier filtering.
@@ -26,17 +26,17 @@ class DualLayerMAD:
     """
     __slots__ = ('window_size', 'history')
 
-    def __init__(self, window_size: int = 32):
+    def __init__(self, window_size=32):
         if window_size < 4:
             raise ValueError("window_size must be at least 4.")
         self.window_size = int(window_size)
-        self.history: List[float] = []
+        self.history = []
 
-    def reset(self) -> None:
+    def reset(self):
         """Reset the internal history buffer."""
-        self.history.clear()
+        del self.history[:]
 
-    def update(self, value: float) -> None:
+    def update(self, value):
         """
         [EN] Push a new scalar observation into the rolling window.
         [KO] 새로운 스칼라 관측값을 롤링 윈도우에 추가.
@@ -45,7 +45,7 @@ class DualLayerMAD:
         if len(self.history) > self.window_size:
             self.history.pop(0)
 
-    def get_std(self) -> float:
+    def get_std(self):
         """
         [EN] Estimate robust standard deviation (sigma) of noise background.
         [KO] 노이즈 배경의 강건한 절단 정규분포 보정 표준편차(sigma) 추정.
@@ -65,7 +65,7 @@ class DualLayerMAD:
 
         return _dual_mad_std_from_list(sample_set)
 
-    def get_variance(self) -> float:
+    def get_variance(self):
         """
         [EN] Estimate robust noise variance (sigma^2).
         [KO] 노이즈 배경의 강건한 분산(sigma^2) 추정.
@@ -308,15 +308,15 @@ class SecondarySync(ClockSync):
 
 _SQRT2 = 1.4142135623730951
 
-def _norm_cdf(x: float) -> float:
+def _norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / _SQRT2))
 
 _INV_SQRT2PI = 0.3989422804014327
 
-def _norm_pdf(x: float) -> float:
+def _norm_pdf(x):
     return math.exp(-0.5 * x * x) * _INV_SQRT2PI
 
-def _norm_ppf(p: float) -> float:
+def _norm_ppf(p):
     z = 0.0
     for _ in range(6):
         err = _norm_cdf(z) - p
@@ -328,16 +328,14 @@ _Z75 = _norm_ppf(0.75)
 
 _C_GAUSS = 1.0 / _Z75
 
-def _debias_mad1_point_mass(mad1: float, p0_hat: float) -> float:
+def _debias_mad1_point_mass(mad1, p0_hat):
     if p0_hat <= 0.0:
         return mad1
     p_eff = p0_hat if p0_hat < 0.49 else 0.49
     z_zi = _norm_ppf(1.0 - 0.25 / (1.0 - p_eff))
     return mad1 * (_Z75 / z_zi)
 
-def _excess_point_mass_list(
-    sorted_devs: List[float], tol: float
-) -> Tuple[int, float]:
+def _excess_point_mass_list(sorted_devs, tol):
     n = len(sorted_devs)
     first_gt = bisect.bisect_right(sorted_devs, tol)
     if first_gt < 2 or first_gt >= n:
@@ -350,20 +348,20 @@ def _excess_point_mass_list(
         return first_gt, 0.0
     return first_gt, float(first_gt) / float(n)
 
-def _median_sorted_range(s: List[float], offset: int, count: int) -> float:
+def _median_sorted_range(s, offset, count):
     mid = offset + (count >> 1)
     if count & 1:
         return s[mid]
     return 0.5 * (s[mid - 1] + s[mid])
 
-def _median_sorted(s: List[float]) -> float:
+def _median_sorted(s):
     return _median_sorted_range(s, 0, len(s))
 
 _C0_TAU25 = 2.5 * _Z75
 
 _Q0_TAU25 = _norm_ppf(0.25 + 0.5 * _norm_cdf(_C0_TAU25))
 
-def _truncated_mad_fixed_point(mad2: float, r1: float) -> float:
+def _truncated_mad_fixed_point(mad2, r1):
     sig = mad2 / _Q0_TAU25
     r1_floor = 1e-12 * max(r1, 1.0)
     for _ in range(4):
@@ -371,7 +369,7 @@ def _truncated_mad_fixed_point(mad2: float, r1: float) -> float:
         sig = mad2 / _norm_ppf(0.25 + 0.5 * _norm_cdf(c_eff))
     return sig
 
-def _mixture_mad_fixed_point(mad2: float, r1: float, p0_in: float) -> float:
+def _mixture_mad_fixed_point(mad2, r1, p0_in):
     if p0_in <= 0.0:
         return _truncated_mad_fixed_point(mad2, r1)
     w_in = (1.0 - 2.0 * p0_in) / (4.0 * (1.0 - p0_in))
@@ -382,7 +380,7 @@ def _mixture_mad_fixed_point(mad2: float, r1: float, p0_in: float) -> float:
         sig = mad2 / _norm_ppf(0.5 + w_in * (2.0 * _norm_cdf(c_eff) - 1.0))
     return sig
 
-def _dual_mad_std_from_list(sample_set: List[float]) -> float:
+def _dual_mad_std_from_list(sample_set):
     n = len(sample_set)
     if n < 2:
         return 0.0
